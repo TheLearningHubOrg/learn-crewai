@@ -1,0 +1,26 @@
+# Task definitions. {topic} and {audience} are filled from kickoff(inputs=...).
+research_task:
+  description: >
+    Research the topic below for the stated audience. Use the glossary tool
+    for any CrewAI term you mention.
+
+    Topic: {topic}
+
+    Audience: {audience}
+  expected_output: >
+    Three to five bullet points of research notes, each one factual sentence.
+  agent: researcher
+
+brief_task:
+  description: >
+    Write a brief from the research notes in your context.
+
+    Topic: {topic}
+
+    Audience: {audience}
+  expected_output: >
+    A JSON object with the fields topic, headline, key_points (3-5 items)
+    and audience.
+  agent: writer
+  context:
+    - research_task

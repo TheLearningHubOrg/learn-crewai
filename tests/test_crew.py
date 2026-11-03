@@ -1,141 +1,103 @@
-"""
-Unit test suite for the CrewAI Multi-Agent Autonomous Orchestration Engine.
-Tests cover Agent execution, Task context flow, Tools, Memory tiers, Hierarchical crews, and Flows.
-"""
+from crewai import Process, TaskOutput
 
-import unittest
-from src.learn_crewai.crew import (
-    Agent,
-    Task,
-    Crew,
-    Process,
-    CrewOutput,
-    BaseTool,
-    tool,
-    ShortTermMemory,
-    LongTermMemory,
-    EntityMemory,
-    Flow,
-    start,
-    listen
-)
-from src.learn_crewai.roadmap import (
-    CREWAI_STAGES,
-    get_completed_count,
-    get_progress_percentage
-)
+from app.crew import BriefingCrew, validate_brief
+from app.llm import OfflineLLM
+from app.schemas import Brief
 
 
-class TestCrewAIEngine(unittest.TestCase):
+class Recorder:
+    """LLM factory that remembers every OfflineLLM it hands out."""
 
-    def setUp(self):
-        @tool("math_tool", description="Calculates math.")
-        def math_tool(expr: str) -> str:
-            return "42"
+    def __init__(self):
+        self.made: list[OfflineLLM] = []
 
-        self.math_tool = math_tool
-        self.agent1 = Agent(
-            role="Research Analyst",
-            goal="Analyze AI market trends",
-            backstory="Experienced technology researcher",
-            tools=[self.math_tool],
-            memory=True,
-        )
+    def __call__(self) -> OfflineLLM:
+        llm = OfflineLLM()
+        self.made.append(llm)
+        return llm
 
-    def test_agent_task_execution_with_tool(self):
-        task = Task(
-            description="Use math_tool to compute token budget",
-            expected_output="Computed budget",
-            agent=self.agent1
-        )
-        output = task.execute()
-        self.assertIn("Research Analyst", output)
-        self.assertIn("Used math_tool: 42", output)
-
-    def test_task_context_chaining(self):
-        agent2 = Agent(
-            role="Editor",
-            goal="Refine technical reports",
-            backstory="Professional editor"
-        )
-        task1 = Task(
-            description="Generate baseline facts",
-            expected_output="Facts report",
-            agent=self.agent1
-        )
-        task1.execute()
-
-        task2 = Task(
-            description="Edit baseline facts",
-            expected_output="Final edit",
-            agent=agent2,
-            context=[task1]
-        )
-        out2 = task2.execute()
-        self.assertIn("Editor", out2)
-        self.assertIn("Edit baseline facts", out2)
-
-    def test_sequential_crew_kickoff(self):
-        t1 = Task(description="Step 1 analysis", expected_output="Out 1", agent=self.agent1)
-        crew = Crew(
-            agents=[self.agent1],
-            tasks=[t1],
-            process=Process.SEQUENTIAL,
-            memory=True
-        )
-        output = crew.kickoff()
-        self.assertIsInstance(output, CrewOutput)
-        self.assertEqual(len(output.tasks_output), 1)
-        self.assertIn("Step 1 analysis", output.raw)
-
-    def test_hierarchical_crew_with_manager(self):
-        t1 = Task(description="Implement critical microservice", expected_output="Microservice spec", agent=self.agent1)
-        crew = Crew(
-            agents=[self.agent1],
-            tasks=[t1],
-            process=Process.HIERARCHICAL,
-            memory=True
-        )
-        output = crew.kickoff()
-        self.assertIn("Manager", output.raw)
-        self.assertIn("Research Analyst", output.raw)
-
-    def test_memory_systems(self):
-        short_mem = ShortTermMemory()
-        short_mem.save("Tester", "Message A")
-        short_mem.save("Tester", "Message B")
-        ctx = short_mem.get_context()
-        self.assertIn("Message A", ctx)
-        self.assertIn("Message B", ctx)
-
-        long_mem = LongTermMemory()
-        long_mem.put("cluster_id", "prod-west-2")
-        self.assertEqual(long_mem.get("cluster_id"), "prod-west-2")
-
-        entity_mem = EntityMemory()
-        entity_mem.extract_and_store("Kubernetes and Docker run inside AWS Cloud.")
-        top_entities = [e[0] for e in entity_mem.get_top_entities()]
-        self.assertTrue(any(item in top_entities for item in ["Kubernetes", "Docker", "AWS"]))
-
-    def test_flow_event_chain(self):
-        class SampleFlow(Flow):
-            @start
-            def step_one(self):
-                return "ONE"
-
-            @listen("step_one")
-            def step_two(self, prev):
-                return f"{prev}->TWO"
-
-        flow = SampleFlow()
-        res = flow.kickoff()
-        self.assertEqual(res, "ONE->TWO")
-
-    def test_roadmap_7_stages(self):
-        self.assertEqual(len(CREWAI_STAGES), 7)
-        self.assertEqual(get_completed_count(), 7)
-        self.assertEqual(get_progress_percentage(), 100)
+    @property
+    def prompts(self) -> list[str]:
+        return [p for llm in self.made for p in llm.prompts]
 
 
-if __name__ == "__main__":
-    unittest.main()
+def run(topic="task guardrails", audience="SREs"):
+    recorder = Recorder()
+    crew = BriefingCrew(llm_factory=recorder).crew()
+    return recorder, crew, crew.kickoff(inputs={"topic": topic, "audience": audience})
+
+
+def test_crew_shape():
+    crew = BriefingCrew(llm_factory=OfflineLLM).crew()
+    assert crew.process == Process.sequential
+    assert [a.role.strip() for a in crew.agents] == ["CrewAI Research Analyst", "Technical Brief Writer"]
+    assert len(crew.tasks) == 2
+    assert crew.tasks[1].context == [crew.tasks[0]]
+
+
+def test_kickoff_returns_structured_brief():
+    _, _, result = run()
+    assert isinstance(result.pydantic, Brief)
+    assert result.pydantic.topic == "task guardrails"
+    assert result.pydantic.audience == "SREs"
+    assert 3 <= len(result.pydantic.key_points) <= 5
+
+
+def test_inputs_are_interpolated_and_context_flows():
+    llm, _, result = run(topic="flows")
+    writer_prompts = [p for p in llm.prompts if "Technical Brief Writer" in p]
+    assert writer_prompts, "writer agent was never called"
+    # The researcher's notes are injected into the writer's prompt via context.
+    assert "Research notes on flows" in writer_prompts[-1]
+    assert len(result.tasks_output) == 2
+
+
+def test_researcher_used_the_tool():
+    llm, _, _ = run()
+    assert any("Observation:" in p and "task: A unit of work" in p for p in llm.prompts)
+
+
+def test_guardrail_rejects_long_points():
+    long_point = "x" * 250
+    brief = Brief(topic="t", headline="h", key_points=[long_point, "b", "c"], audience="a")
+    output = TaskOutput(description="d", agent="writer", raw=brief.model_dump_json(), pydantic=brief)
+    ok, reason = validate_brief(output)
+    assert ok is False
+    assert "200 characters" in reason
+
+
+def test_guardrail_accepts_valid_brief():
+    brief = Brief(topic="t", headline="h", key_points=["a", "b", "c"], audience="a")
+    output = TaskOutput(description="d", agent="writer", raw=brief.model_dump_json(), pydantic=brief)
+    assert validate_brief(output)[0] is True
+
+
+def test_guardrail_parses_raw_when_no_model_attached():
+    # Guardrails run before CrewAI attaches output.pydantic, so raw JSON must be enough.
+    raw = Brief(topic="t", headline="h", key_points=["a", "b", "c"], audience="a").model_dump_json()
+    assert validate_brief(TaskOutput(description="d", agent="writer", raw=raw))[0] is True
+
+
+def test_guardrail_rejects_non_json():
+    ok, reason = validate_brief(TaskOutput(description="d", agent="writer", raw="Sure! Here is the brief."))
+    assert ok is False
+    assert "Brief schema" in reason
+
+
+def test_writer_called_once_when_output_is_valid():
+    llm, _, _ = run()
+    writer_calls = [p for p in llm.prompts if "Technical Brief Writer" in p]
+    assert len(writer_calls) == 1, "a guardrail retry happened"
+
+
+def test_token_usage_is_reported():
+    _, _, result = run()
+    assert result.token_usage.total_tokens > 0
+    # researcher: tool call + final answer; writer: one structured answer
+    assert result.token_usage.successful_requests == 3
+
+
+def test_each_agent_has_its_own_llm():
+    crew = BriefingCrew(llm_factory=OfflineLLM).crew()
+    researcher, writer = crew.agents
+    assert researcher.llm is not writer.llm
